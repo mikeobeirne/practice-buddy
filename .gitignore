@@ -1,0 +1,26 @@
+# Node / frontend
+/frontend/node_modules
+/frontend/dist
+/build
+npm-debug.log
+yarn-error.log
+
+# Python venvs
+/backend/.venv
+/backend/venv
+.venv
+venv
+env
+ENV
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Env files
+.env
+.env.*
+
+# Editor / OS
+.vscode/
+.DS_Store
