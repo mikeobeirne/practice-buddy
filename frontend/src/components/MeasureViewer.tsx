@@ -11,6 +11,23 @@ const MeasureViewer: React.FC<Props> = ({ filename, className }) => {
   const osmdRef = useRef<OpenSheetMusicDisplay | null>(null)
   const [error, setError] = useState<string | null>(null)
 
+  // send a practice event to the backend
+  const logPractice = async (difficulty: string) => {
+    if (!filename) return
+    const m = filename.match(/_measure_(\d+)(?:\.musicxml|\.mxl)?$/i)
+    const measure = m ? parseInt(m[1], 10) : null
+    try {
+      await fetch("http://localhost:5000/api/practice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename, measure, difficulty }),
+      })
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("Failed to log practice:", err)
+    }
+  }
+
   useEffect(() => {
     return () => {
       if (containerRef.current) containerRef.current.innerHTML = ""
@@ -100,6 +117,14 @@ const MeasureViewer: React.FC<Props> = ({ filename, className }) => {
         }}
       />
       {error && <div style={{ color: "darkred", marginTop: 8 }}>{error}</div>}
+
+      {/* rating / action buttons under the rendering */}
+      <div style={{ display: "flex", gap: 8, justifyContent: "center", marginTop: 12 }}>
+        <button type="button" onClick={() => logPractice("Easy")}>Easy</button>
+        <button type="button" onClick={() => logPractice("Medium")}>Medium</button>
+        <button type="button" onClick={() => logPractice("Hard")}>Hard</button>
+        <button type="button" onClick={() => logPractice("Snooze")}>Snooze</button>
+      </div>
     </div>
   )
 }
