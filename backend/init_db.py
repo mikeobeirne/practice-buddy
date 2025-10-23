@@ -1,14 +1,12 @@
 import os
 import sqlite3
-import re
 from pathlib import Path
 
-# Config
-DATA_DIR = Path("../frontend/public/data")
-DB_PATH = Path("practice.db")
+DB_PATH = Path(__file__).parent / "practice.db"
+DATA_DIR = Path(__file__).parent.parent / "frontend" / "public" / "data"
 
 def init_tables(db):
-    """Ensure tables exist"""
+    """Initialize fresh schema"""
     db.executescript("""
     CREATE TABLE IF NOT EXISTS songs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,53 +25,75 @@ def init_tables(db):
       group_size INTEGER GENERATED ALWAYS AS (end_measure - start_measure + 1) VIRTUAL,
       FOREIGN KEY (song_id) REFERENCES songs(id)
     );
+
+    CREATE TABLE IF NOT EXISTS practice_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      song_id INTEGER NOT NULL,
+      measure_group_id INTEGER NOT NULL,
+      practiced_at TEXT DEFAULT (datetime('now')),
+      rating TEXT CHECK (rating IN ('easy','medium','hard','snooze')) NOT NULL,
+      duration_seconds INTEGER,
+      notes TEXT,
+      FOREIGN KEY (song_id) REFERENCES songs(id),
+      FOREIGN KEY (measure_group_id) REFERENCES measure_groups(id)
+    );
     """)
     db.commit()
 
 def scan_data_dir():
-    """Scan data directory for songs and measures"""
+    """Scan data directory for songs and their measures"""
     songs = []
-    measure_groups = []  # (song_base, measure_num) tuples
+    measure_groups = []
 
+    # Look for song folders
     for entry in os.scandir(DATA_DIR):
-        if entry.is_file() and (entry.name.endswith('.musicxml') or entry.name.endswith('.mxl')):
-            # top-level file = song
-            base = Path(entry.name).stem
-            if "_measure_" not in base:  # skip any top-level measure files
-                songs.append({
-                    'title': base.replace('-', ' ').title(),
-                    'source_file': entry.name,
-                    'total_measures': 0  # will update after scanning measures
-                })
+        if not entry.is_dir():
+            continue
+        
+        print(f"Checking directory: {entry.path}")  # Debug
+        
+        # Find the main song file (should match folder name)
+        song_files = []
+        for pattern in ["*.musicxml", "*.mxl"]:
+            song_files.extend(Path(entry.path).glob(pattern))
+        
+        print(f"Found files: {song_files}")  # Debug
+        
+        # Find main song file (any file that isn't a measure file)
+        song_file = next((f for f in song_files if "measure_" not in f.name), None)
+        if not song_file:
+            print(f"No main song file found in {entry.path}")  # Debug
+            continue
 
-        elif entry.is_dir():
-            # scan subdirectory for measure files
-            measure_files = []
-            for f in os.scandir(entry.path):
-                if not f.is_file():
-                    continue
-                if not (f.name.endswith('.musicxml') or f.name.endswith('.mxl')):
-                    continue
-                m = re.search(r'_measure_(\d+)', f.name)
-                if m:
-                    measure_num = int(m.group(1))
-                    measure_files.append((f.name, measure_num))
+        # Count measures by looking for measure_*.musicxml files
+        measure_files = sorted(
+            [f for f in Path(entry.path).glob("*.musicxml") if "measure_" in f.name],
+            key=lambda p: int(p.name.split("measure_")[1].split(".")[0])
+        )
+        
+        print(f"Found measures: {measure_files}")  # Debug
+        
+        if measure_files:
+            songs.append({
+                'title': entry.name.replace('-', ' ').title(),
+                'source_file': f"{entry.name}/{song_file.name}",
+                'total_measures': len(measure_files)
+            })
             
-            if measure_files:
-                # Create individual measure groups for each measure
-                for _, measure in measure_files:
-                    measure_groups.append((entry.name, measure))
-                
-                # update total_measures for the song
-                max_measure = max(m for _, m in measure_files)
-                for song in songs:
-                    if song['source_file'].startswith(entry.name):
-                        song['total_measures'] = max_measure
+            # Create individual measure groups
+            for mf in measure_files:
+                measure = int(mf.name.split("measure_")[1].split(".")[0])
+                measure_groups.append((entry.name, measure))
 
     return songs, measure_groups
 
 def main():
     print(f"Scanning {DATA_DIR}")
+    print(f"Path exists: {DATA_DIR.exists()}")
+    print(f"Is directory: {DATA_DIR.is_dir()}")
+    if DATA_DIR.exists():
+        print("Contents:", list(DATA_DIR.iterdir()))
+    
     songs, measure_groups = scan_data_dir()
     
     if not songs:
@@ -84,7 +104,7 @@ def main():
     for s in songs:
         print(f"- {s['title']} ({s['source_file']}) - {s['total_measures']} measures")
     
-    print(f"\nFound {len(measure_groups)} measure groups")
+    print(f"\nFound {len(measure_groups)} individual measures")
     
     if input("\nWrite to database? [y/N] ").lower() != 'y':
         return
@@ -100,29 +120,22 @@ def main():
             (song['title'], song['source_file'], song['total_measures'])
         )
         db.commit()
-        song_ids[song['source_file']] = cur.lastrowid
+        song_ids[song['source_file'].split('/')[0]] = cur.lastrowid
     
-    # Insert measure groups, linking to songs
+    # Insert measure groups
     for folder, measure in measure_groups:
-        # find matching song (where source_file starts with folder name)
-        song_id = None
-        for source_file, sid in song_ids.items():
-            if source_file.startswith(folder):
-                song_id = sid
-                break
-        
+        song_id = song_ids.get(folder)
         if not song_id:
-            print(f"Warning: no song found for measure {folder} measure {measure}")
+            print(f"Warning: no song found for measure in {folder}")
             continue
         
-        # Create single-measure group
         db.execute(
             "INSERT INTO measure_groups (song_id, start_measure, end_measure) VALUES (?, ?, ?)",
-            (song_id, measure, measure)  # start and end are the same measure
+            (song_id, measure, measure)
         )
     
     db.commit()
     print("Done!")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

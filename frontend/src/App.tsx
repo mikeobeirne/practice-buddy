@@ -1,78 +1,129 @@
-import React, { useMemo, useState } from "react"
+import React, { useEffect, useMemo, useState } from "react"
 import "./App.css"
 import MeasureViewer from "./components/MeasureViewer"
+import PracticeSessions from "./components/PracticeSessions"
 
-type SongSpec = {
-  id: string
-  folder: string
-  base: string
-  measures: number
-  display?: string
+// types for our API responses
+interface Song {
+  id: number
+  title: string
+  source_file: string
+  total_measures: number
+}
+
+interface MeasureGroup {
+  id: number
+  song_id: number
+  start_measure: number
+  end_measure: number
+}
+
+interface MeasureRecommendation {
+  measure: number;
+  stats: {
+    category: 'unlearned' | 'challenging' | 'proficient';
+    best_rating: number;
+    practice_count: number;
+    last_practiced: string | null;
+    due_date: string | null;
+  };
 }
 
 function App() {
-  // hard-coded songs with the exact string format you requested
-  const songs: SongSpec[] = [
-    {
-      id: "alicia",
-      folder: "alicia",
-      base: "alicia-clair-obscur-expedition-33-main-theme-piano-solo",
-      measures: 69,
-      display: "Alicia — Clair Obscur (69 measures)",
-    },
-    {
-      id: "brooke",
-      folder: "",
-      base: "BrookeWestSample",
-      measures: 1,
-      display: "Brooke West Sample (single file)",
-    },
-    // add more songs here using the same pattern
-  ]
-
-  const songMap = useMemo(() => {
-    const m = new Map<string, SongSpec>()
-    for (const s of songs) m.set(s.id, s)
-    return m
-  }, [songs])
-
-  const [selectedSongId, setSelectedSongId] = useState<string>("")
-  const selectedSong = selectedSongId ? songMap.get(selectedSongId) ?? null : null
+  const [songs, setSongs] = useState<Song[]>([])
+  const [measureGroups, setMeasureGroups] = useState<MeasureGroup[]>([])
+  const [selectedSongId, setSelectedSongId] = useState<number | null>(null)
   const [measureIndex, setMeasureIndex] = useState<number>(1)
+  const [recommendation, setRecommendation] = useState<MeasureRecommendation | null>(null)
 
-  // when song changes, reset measure index to 1
-  const selectSong = (id: string) => {
+  // fetch songs and measure groups on mount
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const [songsResp, groupsResp] = await Promise.all([
+          fetch("http://localhost:5000/api/songs"),
+          fetch("http://localhost:5000/api/measure-groups")
+        ])
+        const songsData = await songsResp.json()
+        const groupsData = await groupsResp.json()
+        setSongs(songsData)
+        setMeasureGroups(groupsData)
+        // Select first song by default if available
+        if (songsData.length > 0) {
+          setSelectedSongId(songsData[0].id)
+        }
+      } catch (err) {
+        console.error("Failed to fetch data:", err)
+      }
+    }
+    fetchData()
+  }, [])
+
+  // selected song details
+  const selectedSong = selectedSongId ? songs.find(s => s.id === selectedSongId) : null
+
+  // find measure group ID for current song+measure
+  const currentMeasureGroup = useMemo(() => {
+    if (!selectedSongId || !measureIndex) return null
+    return measureGroups.find(mg => 
+      mg.song_id === selectedSongId && 
+      mg.start_measure === measureIndex && 
+      mg.end_measure === measureIndex
+    ) || null
+  }, [selectedSongId, measureIndex, measureGroups])
+
+  // construct filename for current selection
+  const currentFilename = useMemo(() => {
+    if (!selectedSong) return null
+    // Get normalized folder name from source_file
+    const songFolder = selectedSong.source_file.split("/")[0]
+    // Use simplified measure filename format
+    return `${songFolder}/measure_${measureIndex}.musicxml`
+  }, [selectedSong, measureIndex])
+
+  const selectSong = (id: number | null) => {
     setSelectedSongId(id)
     setMeasureIndex(1)
   }
 
   const prev = () => {
     if (!selectedSong) return
-    setMeasureIndex((i) => {
+    setMeasureIndex(i => {
       const next = i - 1
-      return next < 1 ? selectedSong.measures : next
+      return next < 1 ? selectedSong.total_measures : next
     })
   }
 
+  // Modify the fetchNextMeasure function to store recommendation
+  const fetchNextMeasure = async (songId: number) => {
+    try {
+      const response = await fetch(`http://localhost:5000/api/songs/${songId}/next-measure`)
+      if (!response.ok) throw new Error('Failed to get next measure')
+      const data: MeasureRecommendation = await response.json()
+      setMeasureIndex(data.measure)
+      setRecommendation(data)
+    } catch (err) {
+      console.error('Failed to get next measure:', err)
+    }
+  }
+
+  // Remove autoAdvance state and modify the next function
   const next = () => {
     if (!selectedSong) return
-    setMeasureIndex((i) => {
-      const next = i + 1
-      return next > selectedSong.measures ? 1 : next
-    })
+    setMeasureIndex(prev => 
+      prev < selectedSong.total_measures ? prev + 1 : prev
+    )
   }
 
-  // construct filename using the hard-coded pattern:
-  // if folder is provided: `${folder}/${base}_measure_${n}.musicxml`
-  // otherwise: `${base}_measure_${n}.musicxml` (or single file if measures === 1)
-  const currentFilename = useMemo(() => {
-    if (!selectedSong) return null
-    if (selectedSong.measures <= 1) {
-      // single-file song; try .musicxml first, fallback to .mxl
-      return `${selectedSong.folder ? selectedSong.folder + "/" : ""}${selectedSong.base}.musicxml`
+  const getRatingText = (rating: number): string => {
+    switch(rating) {
+      case 0: return "not practiced"
+      case 1: return "hard"
+      case 2: return "medium"
+      case 3: return "easy"
+      default: return "unknown"
     }
-    return `${selectedSong.folder ? selectedSong.folder + "/" : ""}${selectedSong.base}_measure_${measureIndex}.musicxml`
-  }, [selectedSong, measureIndex])
+  }
 
   return (
     <div style={{ padding: 16 }}>
@@ -80,44 +131,70 @@ function App() {
 
       <section style={{ marginTop: 16 }}>
         <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
-          <select value={selectedSongId} onChange={(e) => selectSong(e.target.value)} style={{ flex: 1 }}>
+          <select 
+            value={selectedSongId || ""} 
+            onChange={e => selectSong(e.target.value ? Number(e.target.value) : null)} 
+            style={{ flex: 1 }}
+          >
             <option value="">-- choose a song --</option>
-            {songs.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.display ?? s.base}
-              </option>
+            {songs.map(s => (
+              <option key={s.id} value={s.id}>{s.title}</option>
             ))}
           </select>
 
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <button onClick={prev} disabled={!selectedSong || selectedSong.measures <= 1}>
-              ◀
-            </button>
-
+            <button onClick={prev} disabled={!selectedSong}>◀</button>
             <div style={{ minWidth: 220, textAlign: "center" }}>
               {selectedSong ? (
-                selectedSong.measures > 1 ? (
-                  <span>
-                    {measureIndex} / {selectedSong.measures} — {selectedSong.base}
-                  </span>
-                ) : (
-                  <span>{selectedSong.base} (single file)</span>
-                )
+                <span>
+                  {measureIndex} / {selectedSong.total_measures} — {selectedSong.title}
+                </span>
               ) : (
                 <span style={{ color: "#666" }}>Select a song to see measures</span>
               )}
             </div>
-
-            <button onClick={next} disabled={!selectedSong || selectedSong.measures <= 1}>
-              ▶
-            </button>
+            <button onClick={next} disabled={!selectedSong}>▶</button>
           </div>
         </div>
 
         <div style={{ border: "1px solid #ddd", padding: 8 }}>
-          <MeasureViewer filename={currentFilename || null} />
-          {!currentFilename && <div style={{ color: "#666", marginTop: 8 }}>Select a song and use the arrows to cycle measures.</div>}
+          <MeasureViewer 
+            filename={currentFilename}
+            songId={selectedSongId}
+            measureGroupId={currentMeasureGroup?.id}
+            onMeasureChange={setMeasureIndex}
+          />
         </div>
+      </section>
+
+      {recommendation && recommendation.measure === measureIndex && (
+        <div style={{ 
+          marginTop: 8, 
+          padding: 12,
+          borderRadius: 4,
+          backgroundColor: recommendation.stats.category === 'unlearned' ? '#fff3e0' :
+                          recommendation.stats.category === 'challenging' ? '#e3f2fd' :
+                          '#e8f5e9',
+          fontSize: '0.9em'
+        }}>
+          <div style={{ fontWeight: 'bold', marginBottom: 4 }}>
+            Measure {recommendation.measure} ({recommendation.stats.category})
+          </div>
+          <div>
+            Best rating: {getRatingText(recommendation.stats.best_rating)}
+            {recommendation.stats.practice_count > 0 && (
+              <>
+                {' • '}Practiced {recommendation.stats.practice_count} times
+                {' • '}Last practiced {new Date(recommendation.stats.last_practiced!).toLocaleDateString()}
+                {' • '}Due {new Date(recommendation.stats.due_date!).toLocaleDateString()}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      <section style={{ marginTop: 32 }}>
+        <PracticeSessions />
       </section>
     </div>
   )

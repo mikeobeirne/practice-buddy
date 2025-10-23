@@ -1,30 +1,54 @@
 import React, { useEffect, useRef, useState } from "react"
 import { OpenSheetMusicDisplay } from "opensheetmusicdisplay"
+import RatingButtons from './RatingButtons'
 
 interface Props {
   filename?: string | null
+  songId?: number | null
+  measureGroupId?: number | null
   className?: string
+  onPracticeLogged?: () => void
+  onMeasureChange?: (measure: number) => void
 }
 
-const MeasureViewer: React.FC<Props> = ({ filename, className }) => {
+const MeasureViewer: React.FC<Props> = ({ 
+  filename, 
+  songId,
+  measureGroupId,
+  className,
+  onPracticeLogged,
+  onMeasureChange
+}) => {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const osmdRef = useRef<OpenSheetMusicDisplay | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   // send a practice event to the backend
-  const logPractice = async (difficulty: string) => {
-    if (!filename) return
-    const m = filename.match(/_measure_(\d+)(?:\.musicxml|\.mxl)?$/i)
-    const measure = m ? parseInt(m[1], 10) : null
+  const logPractice = async (rating: string) => {
+    if (!songId || !measureGroupId) return
+    
     try {
+      // Log the practice session
       await fetch("http://localhost:5000/api/practice", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename, measure, difficulty }),
+        body: JSON.stringify({ 
+          song_id: songId,
+          measure_group_id: measureGroupId,
+          rating 
+        }),
       })
+      
+      // Notify parent that practice was logged
+      onPracticeLogged?.()
+
+      // Get next recommended measure
+      const response = await fetch(`http://localhost:5000/api/songs/${songId}/next-measure`)
+      if (!response.ok) throw new Error('Failed to get next measure')
+      const data = await response.json()
+      onMeasureChange?.(data.measure)
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error("Failed to log practice:", err)
+      console.error("Failed to log practice or get next measure:", err)
     }
   }
 
@@ -42,8 +66,6 @@ const MeasureViewer: React.FC<Props> = ({ filename, className }) => {
       // ensure a single OSMD instance exists (create even if no filename)
       if (!osmdRef.current) {
         containerRef.current.innerHTML = ""
-        // Options: hide credits/title/composer/arranger metadata that OSMD would render
-        // Also provide an onXMLRead fallback to strip any <credit> blocks if present.
         osmdRef.current = new OpenSheetMusicDisplay(containerRef.current, {
           backend: "svg",
           drawCredits: false,
@@ -53,6 +75,12 @@ const MeasureViewer: React.FC<Props> = ({ filename, className }) => {
           drawLyricist: false,
           drawPartNames: false,
           drawPartAbbreviations: false,
+          autoResize: true,
+          stretchLastSystemLine: true,     // Makes the measure stretch full width
+          spacingFactorSoftmax: 2,         // Lower value = more compact spacing
+          drawingParameters: "compact",     // Use compact mode for tighter spacing
+          measureNumberInterval: 1,         // Show every measure number
+          pageFormat: "Endless"            // Ensures horizontal layout
         } as any)
       }
       const osmd = osmdRef.current!
@@ -104,13 +132,13 @@ const MeasureViewer: React.FC<Props> = ({ filename, className }) => {
     <div style={{ width: "100%", boxSizing: "border-box" }}>
       <div
         ref={containerRef}
-        className={className}
+        className={className}  // Now className is defined
         // adjust height as you like (px, %, vh). overflow:auto prevents layout shifts when SVG changes height.
         // use flexbox to horizontally center the rendered SVG(s), keep top alignment
         style={{
           height: 520,
           overflow: "auto",
-          width: "100%",
+          width: "50%",
           display: "flex",
           justifyContent: "center",
           alignItems: "flex-start",
@@ -118,12 +146,8 @@ const MeasureViewer: React.FC<Props> = ({ filename, className }) => {
       />
       {error && <div style={{ color: "darkred", marginTop: 8 }}>{error}</div>}
 
-      {/* rating / action buttons under the rendering */}
-      <div style={{ display: "flex", gap: 8, justifyContent: "center", marginTop: 12 }}>
-        <button type="button" onClick={() => logPractice("Easy")}>Easy</button>
-        <button type="button" onClick={() => logPractice("Medium")}>Medium</button>
-        <button type="button" onClick={() => logPractice("Hard")}>Hard</button>
-        <button type="button" onClick={() => logPractice("Snooze")}>Snooze</button>
+      <div style={{ marginTop: 12 }}>
+        <RatingButtons onRate={logPractice} />
       </div>
     </div>
   )

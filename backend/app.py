@@ -21,7 +21,6 @@ def get_db():
 
 def init_db():
     db = get_db()
-    # songs, measure_groups, practice_sessions (schema requested)
     db.executescript(
         """
     CREATE TABLE IF NOT EXISTS songs (
@@ -57,10 +56,16 @@ def init_db():
     db.commit()
 
 
-@app.before_first_request
-def startup():
-    os.makedirs(DATA_DIR, exist_ok=True)
+# Initialize with app context
+os.makedirs(DATA_DIR, exist_ok=True)
+with app.app_context():
     init_db()
+
+
+@app.before_request
+def before_request():
+    # Ensure DB connection exists for this request
+    get_db()
 
 
 @app.teardown_appcontext
@@ -229,6 +234,140 @@ def list_measure_groups():
         "SELECT mg.*, s.title AS song_title FROM measure_groups mg JOIN songs s ON s.id = mg.song_id ORDER BY mg.created_at DESC"
     ).fetchall()
     return jsonify([row_to_dict(r) for r in rows])
+
+
+@app.route("/api/practice-sessions", methods=["GET"])
+def list_practice_sessions():
+    """Return all practice sessions with song and measure info"""
+    db = get_db()
+    rows = db.execute("""
+        SELECT 
+            ps.*,
+            s.title as song_title,
+            mg.start_measure,
+            mg.end_measure
+        FROM practice_sessions ps
+        JOIN songs s ON s.id = ps.song_id
+        JOIN measure_groups mg ON mg.id = ps.measure_group_id
+        ORDER BY ps.practiced_at DESC
+    """).fetchall()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+@app.route("/api/practice-sessions", methods=["DELETE"])
+def clear_practice_sessions():
+    """Clear all practice session history"""
+    db = get_db()
+    db.execute("DELETE FROM practice_sessions")
+    db.commit()
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/songs/<int:song_id>/next-measure", methods=["GET"])
+def get_next_measure(song_id):
+    """Get the next measure using spaced repetition approach."""
+    db = get_db()
+    
+    # Define rating scores
+    rating_scores = {
+        'easy': 3,
+        'medium': 2,
+        'hard': 1,
+        'snooze': 0
+    }
+    
+    # Get song info
+    song = db.execute("SELECT * FROM songs WHERE id = ?", (song_id,)).fetchone()
+    if not song:
+        return jsonify({"error": "Song not found"}), 404
+
+    # Get all measures and their practice history
+    measures_query = """
+    SELECT 
+        mg.start_measure,
+        GROUP_CONCAT(ps.rating) as ratings,
+        COUNT(ps.id) as practice_count,
+        MAX(ps.practiced_at) as last_practiced
+    FROM measure_groups mg
+    LEFT JOIN practice_sessions ps ON mg.id = ps.measure_group_id
+    WHERE mg.song_id = ?
+    GROUP BY mg.start_measure
+    ORDER BY mg.start_measure
+    """
+    
+    rows = db.execute(measures_query, (song_id,)).fetchall()
+    
+    # Process each measure's data
+    measures = []
+    for row in rows:
+        ratings = row['ratings'].split(',') if row['ratings'] else []
+        best_rating = max((rating_scores[r] for r in ratings), default=0)
+        
+        category = 'unlearned'
+        if best_rating >= 3:
+            category = 'proficient'
+        elif best_rating >= 2:  # Changed: require medium (2) or better
+            category = 'challenging'
+        
+        measures.append({
+            'measure': row['start_measure'],
+            'category': category,
+            'best_rating': best_rating,
+            'practice_count': row['practice_count'] or 0,
+            'last_practiced': row['last_practiced']
+        })
+
+    # Find current learning window
+    def is_measure_learned(m):
+        return m['best_rating'] >= 2  # Changed: require medium (2) or better
+    
+    # Start with initial window of 5 measures
+    window_size = 5
+    
+    # Check if we can expand window
+    if len(measures) > window_size:
+        current_window = measures[:window_size]
+        learned_count = sum(1 for m in current_window if is_measure_learned(m))
+        
+        # Only expand if ALL measures up to current window are sufficiently learned
+        if learned_count == window_size:
+            window_size += 3  # Add next chunk
+    
+    # Cap window size at total measures
+    window_size = min(len(measures), window_size)
+    
+    # Filter to measures in current window
+    eligible_measures = measures[:window_size]
+    
+    if not eligible_measures:
+        return jsonify({"measure": 1})
+    
+    # Prioritize unlearned and challenging measures in current window
+    def measure_priority(m):
+        category_score = {
+            'unlearned': 0,
+            'challenging': 1,
+            'proficient': 2
+        }[m['category']]
+        
+        # Prioritize earlier measures within same category
+        return (
+            category_score,
+            m['practice_count'],
+            m['measure']
+        )
+    
+    next_measure = min(eligible_measures, key=measure_priority)
+    
+    return jsonify({
+        "measure": next_measure['measure'],
+        "stats": {
+            "category": next_measure['category'],
+            "best_rating": next_measure['best_rating'],
+            "practice_count": next_measure['practice_count'],
+            "last_practiced": next_measure['last_practiced']
+        }
+    })
 
 
 if __name__ == "__main__":

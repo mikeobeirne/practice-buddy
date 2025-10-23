@@ -1,82 +1,76 @@
 """
-Split an input .mxl (or other MusicXML) file into one .mxl file per measure.
-
-Usage:
-  python split_mxl.py path/to/input.mxl path/to/output_dir
+Split all MusicXML/MXL files in the data directory into individual measure files.
+Each song gets its own subdirectory containing the original file and measure files.
 """
-import argparse
 import logging
-import os
-from music21 import converter, stream
+from pathlib import Path
+from music21 import converter
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
-def collect_measure_numbers(score: stream.Score):
-    nums = set()
-    for part in score.parts:
-        for m in part.getElementsByClass(stream.Measure):
-            if m.number is not None:
-                nums.add(m.number)
-    # fallback: try to collect from top-level measures if none found
-    if not nums:
-        for m in score.getElementsByClass(stream.Measure):
-            if m.number is not None:
-                nums.add(m.number)
-    return sorted(nums)
+def normalize_name(filename: str) -> str:
+    """Convert filename to folder name, stripping extension and special chars"""
+    base = Path(filename).stem
+    return base.lower().replace(" ", "-")
 
 
-def split_mxl(input_path: str, out_dir: str, fmt: str = "musicxml", overwrite: bool = False):
-    """
-    Split input MusicXML or MXL into one file per measure.
+def split_song(input_path: Path):
+    """Split a song file into individual measure files in a subdirectory"""
+    # Create song directory using normalized name
+    song_dir = input_path.parent / normalize_name(input_path.name)
+    song_dir.mkdir(exist_ok=True)
 
-    Default output format changed to 'musicxml' and output files will use the .musicxml extension.
-    """
-    if not os.path.isfile(input_path):
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-    os.makedirs(out_dir, exist_ok=True)
-
+    # Parse score
     logging.info("Parsing %s", input_path)
-    score = converter.parse(input_path)
+    score = converter.parse(str(input_path))
 
-    measure_numbers = collect_measure_numbers(score)
-    if not measure_numbers:
-        logging.warning("No measure numbers found; attempting to split by sequential measure index.")
-        # try using measure indices if no explicit numbers
-        all_measures = list(score.getElementsByClass(stream.Measure))
-        measure_numbers = list(range(1, len(all_measures) + 1))
+    # Copy original file to song directory
+    dest_song = song_dir / input_path.name
+    if not dest_song.exists():
+        score.write(fp=str(dest_song))
 
-    base = os.path.splitext(os.path.basename(input_path))[0]
+    # Extract each measure
+    measure_count = 0
+    for num in range(1, len(score.measureNumbers) + 1):
+        out_path = song_dir / f"measure_{num}.musicxml"
+        if out_path.exists():
+            logging.info("Skipping existing %s", out_path)
+            measure_count += 1
+            continue
 
-    # map chosen format to file extension
-    ext = "musicxml" if fmt == "musicxml" else ("mxl" if fmt == "mxl" else fmt)
-
-    for num in measure_numbers:
         try:
-            sub = score.measures(num, num)
-            if sub is None or len(sub.parts) == 0:
-                logging.warning("No content for measure %s — skipping", num)
+            measure = score.measures(num, num)
+            if not measure or not measure.parts:
+                logging.warning("No content in measure %s", num)
                 continue
-            out_name = f"{base}_measure_{num}.{ext}"
-            out_path = os.path.join(out_dir, out_name)
-            if os.path.exists(out_path) and not overwrite:
-                logging.info("Skipping existing file %s", out_path)
-                continue
-            logging.info("Writing measure %s -> %s", num, out_path)
-            sub.write(fmt, fp=out_path)
+
+            measure.write("musicxml", fp=str(out_path))
+            logging.info("Created %s", out_path)
+            measure_count += 1
+
         except Exception as e:
-            logging.error("Failed to write measure %s: %s", num, e)
+            logging.error("Failed to process measure %s: %s", num, e)
+
+    return measure_count
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Split a .mxl/.musicxml file into per-measure files.")
-    parser.add_argument("input", help="Path to input .mxl or .xml file")
-    parser.add_argument("outdir", help="Output directory for per-measure files")
-    parser.add_argument("--format", choices=["mxl", "musicxml"], default="musicxml", help="Output format (default: musicxml)")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
-    args = parser.parse_args()
+    # Always use the frontend data directory
+    data_dir = Path(__file__).resolve().parents[3] / "frontend" / "public" / "data"
 
-    split_mxl(args.input, args.outdir, fmt=args.format, overwrite=args.overwrite)
+    # Process all .mxl and .musicxml files that aren't inside song subdirectories
+    music_files = []
+    for ext in ["*.mxl", "*.musicxml"]:
+        music_files.extend(data_dir.glob(ext))
+
+    for file_path in music_files:
+        if "_measure_" not in file_path.name:  # skip any existing measure files
+            try:
+                count = split_song(file_path)
+                logging.info("Processed %s: %d measures", file_path.name, count)
+            except Exception as e:
+                logging.error("Failed to process %s: %s", file_path.name, e)
 
 
 if __name__ == "__main__":
