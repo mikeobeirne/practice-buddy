@@ -3,25 +3,66 @@ import { OpenSheetMusicDisplay } from "opensheetmusicdisplay"
 import RatingButtons from './RatingButtons'
 
 interface Props {
-  filename?: string | null
-  songId?: number | null
-  measureGroupId?: number | null
-  className?: string
-  onPracticeLogged?: () => void
-  onMeasureChange?: (measure: number) => void
+  measureGroupId: string | null
+  onPracticeLogged: () => void
 }
 
 const MeasureViewer: React.FC<Props> = ({ 
-  filename, 
-  songId,
   measureGroupId,
-  className,
   onPracticeLogged,
-  onMeasureChange
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null)
-  const osmdRef = useRef<OpenSheetMusicDisplay | null>(null)
+  const osmdRefs = useRef<OpenSheetMusicDisplay[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [songId, setSongId] = useState<number | null>(null)
+
+  // Parse measure info from group ID
+  const getMeasureInfo = (id: string) => {
+    const [folder, measurePart] = id.split('|')
+    const match = measurePart.match(/measure(\d+)(?:-(\d+))?/)
+    if (!match) return null
+    
+    const start = parseInt(match[1], 10)
+    const end = match[2] ? parseInt(match[2], 10) : start
+    return { folder, start, end }
+  }
+
+  // Get filenames to load based on measure group
+  const getFilesToLoad = (id: string): string[] => {
+    const info = getMeasureInfo(id)
+    if (!info) return []
+    
+    if (info.start === info.end) {
+      // Single measure
+      return [`${info.folder}/measure_${info.start}.musicxml`]
+    } else {
+      // Measure group
+      return [`${info.folder}/measures_${info.start}-${info.end}.musicxml`]
+    }
+  }
+
+  // Get song ID for measure group
+  useEffect(() => {
+    const fetchSongId = async () => {
+      if (!measureGroupId) return
+      const info = getMeasureInfo(measureGroupId)
+      if (!info) return
+      
+      try {
+        const resp = await fetch("http://localhost:5000/api/measure-groups")
+        if (!resp.ok) throw new Error("Failed to fetch measure groups")
+        const groups = await resp.json()
+        const group = groups.find((g: any) => g.id === measureGroupId)
+        if (group) {
+          setSongId(group.song_id)
+        }
+      } catch (err) {
+        console.error("Failed to get song ID:", err)
+        setError("Failed to load song information")
+      }
+    }
+    fetchSongId()
+  }, [measureGroupId])
 
   // send a practice event to the backend
   const logPractice = async (rating: string) => {
@@ -41,107 +82,89 @@ const MeasureViewer: React.FC<Props> = ({
       
       // Notify parent that practice was logged
       onPracticeLogged?.()
-
-      // Get next recommended measure
-      const response = await fetch(`http://localhost:5000/api/songs/${songId}/next-measure`)
-      if (!response.ok) throw new Error('Failed to get next measure')
-      const data = await response.json()
-      onMeasureChange?.(data.measure)
     } catch (err) {
       console.error("Failed to log practice or get next measure:", err)
     }
   }
 
-  useEffect(() => {
-    return () => {
-      if (containerRef.current) containerRef.current.innerHTML = ""
-      osmdRef.current = null
-    }
-  }, [])
-
+  // Load and render measures
   useEffect(() => {
     const load = async () => {
-      if (!containerRef.current) return
-
-      // ensure a single OSMD instance exists (create even if no filename)
-      if (!osmdRef.current) {
-        containerRef.current.innerHTML = ""
-        osmdRef.current = new OpenSheetMusicDisplay(containerRef.current, {
-          backend: "svg",
-          drawCredits: false,
-          drawTitle: false,
-          drawSubtitle: false,
-          drawComposer: false,
-          drawLyricist: false,
-          drawPartNames: false,
-          drawPartAbbreviations: false,
-          autoResize: true,
-          stretchLastSystemLine: true,     // Makes the measure stretch full width
-          spacingFactorSoftmax: 2,         // Lower value = more compact spacing
-          drawingParameters: "compact",     // Use compact mode for tighter spacing
-          measureNumberInterval: 1,         // Show every measure number
-          pageFormat: "Endless"            // Ensures horizontal layout
-        } as any)
-      }
-      const osmd = osmdRef.current!
-
-      setError(null)
-
-      // if no filename yet, we've initialized OSMD and can return early
-      if (!filename) return
+      if (!containerRef.current || !measureGroupId) return
 
       try {
-        // clear previous render/output before loading new file
-        try { osmd.clear && osmd.clear() } catch { /* ignore */ }
-        if (containerRef.current) containerRef.current.innerHTML = ""
+        // Clear previous render
+        containerRef.current.innerHTML = ""
+        osmdRefs.current = []
 
-        const safePath = "/data/" + filename.split("/").map(encodeURIComponent).join("/")
-        const resp = await fetch(safePath, { cache: "no-store" })
+        const measureFiles = getFilesToLoad(measureGroupId)
 
-        const contentType = resp.headers.get("content-type") ?? ""
-        if (contentType.includes("text/html")) {
-          throw new Error(`Requested ${safePath} returned HTML (file not found).`)
-        }
+        // Create a container for each measure
+        const measureContainers = measureFiles.map((_, i) => {
+          const div = document.createElement('div')
+          div.style.flex = '1'
+          div.style.minWidth = '300px'
+          div.style.margin = '0 4px'
+          containerRef.current!.appendChild(div)
+          return div
+        })
 
-        const buf = await resp.arrayBuffer()
-        const u8 = new Uint8Array(buf)
-        // detect ZIP header 'PK'
-        if (u8[0] === 0x50 && u8[1] === 0x4b) {
-          throw new Error("Detected compressed .mxl (zip). Please produce uncompressed .musicxml files or enable client unzip support.")
-        }
+        // Load each measure in its own OSMD instance
+        await Promise.all(measureFiles.map(async (file, i) => {
+          const osmd = new OpenSheetMusicDisplay(measureContainers[i], {
+            backend: "svg",
+            drawCredits: false,
+            drawTitle: false,
+            drawSubtitle: false,
+            drawComposer: false,
+            drawLyricist: false,
+            drawPartNames: false,
+            drawPartAbbreviations: false,
+            autoResize: true,
+            //stretchLastSystemLine: true,
+            spacingFactorSoftmax: 2,
+            drawingParameters: "compact",
+            measureNumberInterval: 1,
+            pageFormat: "Endless"
+          } as any)
 
-        if (!resp.ok) throw new Error(`Fetch failed: ${resp.status}`)
+          osmdRefs.current.push(osmd)
 
-        const xml = new TextDecoder().decode(u8)
+          const safePath = "/data/" + file.split("/").map(encodeURIComponent).join("/")
+          const resp = await fetch(safePath, { cache: "no-store" })
+          if (!resp.ok) throw new Error(`Failed to load ${safePath}`)
+          const buf = await resp.arrayBuffer()
+          const xml = new TextDecoder().decode(buf)
 
-        await osmd.load(xml)
-        await osmd.render()
+          await osmd.load(xml)
+          await osmd.render()
+        }))
+
       } catch (err: any) {
-        // eslint-disable-next-line no-console
         console.error("MeasureViewer error:", err)
         setError(String(err?.message ?? err))
-        if (containerRef.current) containerRef.current.innerHTML = `<div style="color:darkred">Error loading ${filename}</div>`
       }
     }
 
     load()
-  }, [filename])
+  }, [measureGroupId])
 
   return (
     // fixed-height outer box keeps page layout stable while the OSMD SVG inside can scroll/auto-size
     <div style={{ width: "100%", boxSizing: "border-box" }}>
       <div
         ref={containerRef}
-        className={className}  // Now className is defined
         // adjust height as you like (px, %, vh). overflow:auto prevents layout shifts when SVG changes height.
         // use flexbox to horizontally center the rendered SVG(s), keep top alignment
         style={{
           height: 520,
           overflow: "auto",
-          width: "50%",
+          width: "100%",
           display: "flex",
           justifyContent: "center",
           alignItems: "flex-start",
+          // Add horizontal scroll if measures overflow
+          overflowX: "auto"
         }}
       />
       {error && <div style={{ color: "darkred", marginTop: 8 }}>{error}</div>}

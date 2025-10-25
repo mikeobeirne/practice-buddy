@@ -1,8 +1,12 @@
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify, g, Response  # Added Response
 from flask_cors import CORS
 import sqlite3
 import os
 from typing import List
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Dict, Optional
+import random
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "practice.db")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")  # optional, not required for schema
@@ -95,129 +99,31 @@ def file_candidates_from_song_and_measure(song_row: sqlite3.Row, measure: int) -
 # CRUD endpoints (minimal)
 
 
-@app.route("/api/songs", methods=["POST"])
-def create_song():
-    data = request.get_json() or {}
-    title = data.get("title")
-    if not title:
-        return jsonify({"error": "title required"}), 400
-    composer = data.get("composer")
-    source_file = data.get("source_file")
-    total_measures = int(data.get("total_measures") or 0)
-    db = get_db()
-    cur = db.execute(
-        "INSERT INTO songs (title, composer, source_file, total_measures) VALUES (?, ?, ?, ?)",
-        (title, composer, source_file, total_measures),
-    )
-    db.commit()
-    return jsonify({"id": cur.lastrowid}), 201
-
-
-@app.route("/api/measure-groups", methods=["POST"])
-def create_measure_group():
-    data = request.get_json() or {}
-    song_id = data.get("song_id")
-    start = int(data.get("start_measure") or 0)
-    end = int(data.get("end_measure") or 0)
-    if not song_id or start < 1 or end < start:
-        return jsonify({"error": "invalid payload"}), 400
-    db = get_db()
-    cur = db.execute(
-        "INSERT INTO measure_groups (song_id, start_measure, end_measure) VALUES (?, ?, ?)",
-        (song_id, start, end),
-    )
-    db.commit()
-    return jsonify({"id": cur.lastrowid}), 201
-
-
 @app.route("/api/practice", methods=["POST"])
 def log_practice():
     data = request.get_json() or {}
-    rating = data.get("rating") or data.get("difficulty")
+    
+    # Validate required fields
+    rating = data.get("rating")
     if rating not in ("easy", "medium", "hard", "snooze"):
         return jsonify({"error": "rating required and must be one of easy/medium/hard/snooze"}), 400
+    
     song_id = data.get("song_id")
     measure_group_id = data.get("measure_group_id")
+    if not song_id or not measure_group_id:
+        return jsonify({"error": "song_id and measure_group_id required"}), 400
+
+    # Optional fields
     duration_seconds = data.get("duration_seconds")
     notes = data.get("notes")
-    # accept fallback payloads where client only sends filename/measure/measureId:
-    filename = data.get("filename")
-    measure = data.get("measure")
-    measureId = data.get("measureId")
+    
     db = get_db()
-
-    # If song_id/measure_group_id provided, use them directly.
-    if not song_id or not measure_group_id:
-        # try best-effort mapping: if filename present, try to find song by matching source_file basename
-        if filename:
-            # try to find song where source_file basename is prefix of filename
-            fname = os.path.basename(filename)
-            base_candidate = os.path.splitext(fname)[0].split("_measure_")[0]
-            row = db.execute("SELECT * FROM songs WHERE source_file LIKE ? LIMIT 1", (f"%{base_candidate}%",)).fetchone()
-            if row:
-                song_id = row["id"]
-        # if measureId provided (e.g. "3_4_5"), try to find matching measure_group by exact string in notes? (not implemented)
-        # if measure provided and song_id found, try to find a measure_group that contains that measure
-        if song_id and measure:
-            mg = db.execute(
-                "SELECT * FROM measure_groups WHERE song_id = ? AND start_measure <= ? AND end_measure >= ? LIMIT 1",
-                (song_id, measure, measure),
-            ).fetchone()
-            if mg:
-                measure_group_id = mg["id"]
-
-    if not song_id or not measure_group_id:
-        return jsonify({"error": "song_id and measure_group_id required (or provide filename/measure that can be resolved)"}), 400
-
     cur = db.execute(
         "INSERT INTO practice_sessions (song_id, measure_group_id, rating, duration_seconds, notes) VALUES (?, ?, ?, ?, ?)",
         (song_id, measure_group_id, rating, duration_seconds, notes),
     )
     db.commit()
     return jsonify({"id": cur.lastrowid}), 201
-
-
-@app.route("/api/next", methods=["GET"])
-def next_to_practice():
-    """
-    Returns an ordered list of filenames (strings). Strategy:
-      - consider all measure_groups (optionally filtered by song_id or prefix)
-      - compute practice count per group (practice_sessions)
-      - sort by fewest practice count, then older groups first
-      - return filenames constructed from song.source_file + measure start
-    Query params:
-      song_id (optional)
-      limit (optional, default 10)
-    """
-    limit = int(request.args.get("limit", 10))
-    song_id_filter = request.args.get("song_id")
-
-    db = get_db()
-
-    params = []
-    q = """
-    SELECT mg.*, s.source_file,
-      (SELECT COUNT(*) FROM practice_sessions ps WHERE ps.measure_group_id = mg.id) AS practice_count
-    FROM measure_groups mg
-    JOIN songs s ON s.id = mg.song_id
-    """
-    if song_id_filter:
-        q += " WHERE mg.song_id = ?"
-        params.append(song_id_filter)
-    q += " ORDER BY practice_count ASC, mg.created_at ASC LIMIT ?"
-    params.append(limit)
-
-    rows = db.execute(q, params).fetchall()
-
-    filenames: List[str] = []
-    for r in rows:
-        # prefer returning the start_measure file for the group
-        start = r["start_measure"]
-        song_row = r
-        candidates = file_candidates_from_song_and_measure(song_row, start)
-        # return first candidate (musicxml) — client can try that path
-        filenames.append(candidates[0])
-    return jsonify(filenames)
 
 
 @app.route("/api/songs", methods=["GET"])
@@ -263,109 +169,182 @@ def clear_practice_sessions():
     return jsonify({"status": "ok"})
 
 
-@app.route("/api/songs/<int:song_id>/next-measure", methods=["GET"])
-def get_next_measure(song_id):
-    """Get the next measure using spaced repetition approach."""
-    db = get_db()
-    
-    # Define rating scores
-    rating_scores = {
+class ProficiencyLevel(Enum):
+    PROFICIENT = 4
+    DECENT = 3
+    NEEDS_PRACTICE = 2
+    UNLEARNED = 1
+
+@dataclass
+class MeasureItem:
+    id: str
+    start: int
+    end: int
+    best_rating: int
+    practice_count: int
+    last_practiced: Optional[str]
+    category: str
+
+    # Add rating scores as class variable
+    RATING_SCORES = {
         'easy': 3,
         'medium': 2,
         'hard': 1,
         'snooze': 0
     }
     
+    @property
+    def is_group(self) -> bool:
+        return self.start != self.end
+    
+    @classmethod
+    def from_db_row(cls, row: sqlite3.Row, ratings: List[str]) -> 'MeasureItem':
+        best_rating = max((cls.RATING_SCORES[r] for r in ratings), default=0)
+        category = (
+            'proficient' if best_rating >= 3
+            else 'decent' if best_rating >= 2
+            else 'needs_practice' if best_rating >= 1
+            else 'unlearned'
+        )
+        
+        return cls(
+            id=row['id'],
+            start=row['start_measure'],
+            end=row['end_measure'],
+            best_rating=best_rating,
+            practice_count=row['practice_count'] or 0,
+            last_practiced=row['last_practiced'],
+            category=category
+        )
+
+def get_next_measure(song_id: int):
+    """Get next measure to practice using spaced repetition algorithm"""
+    db = get_db()
+    
     # Get song info
     song = db.execute("SELECT * FROM songs WHERE id = ?", (song_id,)).fetchone()
     if not song:
         return jsonify({"error": "Song not found"}), 404
 
-    # Get all measures and their practice history
-    measures_query = """
+    measures = get_all_measures(db, song_id)
+    if not measures:
+        return jsonify({"measure": 1})
+        
+    eligible_items = get_eligible_items(measures)
+    if not eligible_items:
+        return jsonify({"measure": 1})
+        
+    next_item = select_next_item(eligible_items)
+    return create_response(next_item)
+
+@app.route("/api/songs/<int:song_id>/next-measure", methods=["GET"])
+def next_measure_for_song(song_id: int):
+    """Get next measure to practice for a specific song using spaced repetition"""
+    return get_next_measure(song_id)
+
+def get_all_measures(db, song_id: int) -> Dict[str, List[MeasureItem]]:
+    """Get all measures and their practice history"""
+    query = """
     SELECT 
-        mg.start_measure,
+        mg.id, mg.start_measure, mg.end_measure,
         GROUP_CONCAT(ps.rating) as ratings,
         COUNT(ps.id) as practice_count,
         MAX(ps.practiced_at) as last_practiced
     FROM measure_groups mg
     LEFT JOIN practice_sessions ps ON mg.id = ps.measure_group_id
     WHERE mg.song_id = ?
-    GROUP BY mg.start_measure
-    ORDER BY mg.start_measure
+    GROUP BY mg.id, mg.start_measure, mg.end_measure
+    ORDER BY mg.start_measure, mg.end_measure
     """
     
-    rows = db.execute(measures_query, (song_id,)).fetchall()
+    rows = db.execute(query, (song_id,)).fetchall()
+    single_measures = []
+    measure_groups = []
     
-    # Process each measure's data
-    measures = []
     for row in rows:
         ratings = row['ratings'].split(',') if row['ratings'] else []
-        best_rating = max((rating_scores[r] for r in ratings), default=0)
+        item = MeasureItem.from_db_row(row, ratings)
         
-        category = 'unlearned'
-        if best_rating >= 3:
-            category = 'proficient'
-        elif best_rating >= 2:  # Changed: require medium (2) or better
-            category = 'challenging'
-        
-        measures.append({
-            'measure': row['start_measure'],
-            'category': category,
-            'best_rating': best_rating,
-            'practice_count': row['practice_count'] or 0,
-            'last_practiced': row['last_practiced']
-        })
+        if item.is_group:
+            measure_groups.append(item)
+        else:
+            single_measures.append(item)  # Uncommented and properly indented
+            
+    return {'single': single_measures, 'groups': measure_groups}
 
+def get_eligible_items(measures: Dict[str, List[MeasureItem]]) -> List[MeasureItem]:
+    """Determine which items are eligible for practice"""
+    single_measures = measures['single']
+    measure_groups = measures['groups']
+    
     # Find current learning window
-    def is_measure_learned(m):
-        return m['best_rating'] >= 2  # Changed: require medium (2) or better
+    window_size = 1
+    max_measure = 1
     
-    # Start with initial window of 5 measures
-    window_size = 5
-    
-    # Check if we can expand window
-    if len(measures) > window_size:
-        current_window = measures[:window_size]
-        learned_count = sum(1 for m in current_window if is_measure_learned(m))
+    while window_size <= len(single_measures):
+        current_window = single_measures[:window_size]
+        current_groups = [
+            g for g in measure_groups 
+            if g.start >= 1 and g.end <= window_size
+        ]
         
-        # Only expand if ALL measures up to current window are sufficiently learned
-        if learned_count == window_size:
-            window_size += 3  # Add next chunk
+        if (all(m.category == 'proficient' for m in current_window) and 
+            all(g.category == 'proficient' for g in current_groups)):
+            window_size += 1
+            max_measure = window_size
+        else:
+            break
     
-    # Cap window size at total measures
-    window_size = min(len(measures), window_size)
+    # Get eligible items within window
+    eligible_items = []
     
-    # Filter to measures in current window
-    eligible_measures = measures[:window_size]
+    # Add non-proficient single measures
+    window_measures = [m for m in single_measures if m.start <= max_measure]
+    eligible_items.extend([m for m in window_measures if m.category != 'proficient'])
     
-    if not eligible_measures:
-        return jsonify({"measure": 1})
+    # If all singles proficient, add non-proficient groups
+    if not eligible_items:
+        window_groups = [g for g in measure_groups if g.start >= 1 and g.end <= max_measure]
+        eligible_items.extend([g for g in window_groups if g.category != 'proficient'])
     
-    # Prioritize unlearned and challenging measures in current window
-    def measure_priority(m):
-        category_score = {
-            'unlearned': 0,
-            'challenging': 1,
-            'proficient': 2
-        }[m['category']]
+    # If everything proficient, add next measure
+    if not eligible_items and max_measure < len(single_measures):
+        eligible_items.append(single_measures[max_measure])
         
-        # Prioritize earlier measures within same category
-        return (
-            category_score,
-            m['practice_count'],
-            m['measure']
-        )
+    return eligible_items
+
+def select_next_item(eligible_items: List[MeasureItem]) -> MeasureItem:
+    """Select next item using weighted random selection"""
+    categorized = {
+        ProficiencyLevel.PROFICIENT: [m for m in eligible_items if m.category == 'proficient'],
+        ProficiencyLevel.DECENT: [m for m in eligible_items if m.category == 'decent'],
+        ProficiencyLevel.NEEDS_PRACTICE: [m for m in eligible_items if m.category == 'needs_practice'],
+        ProficiencyLevel.UNLEARNED: [m for m in eligible_items if m.category == 'unlearned']
+    }
     
-    next_measure = min(eligible_measures, key=measure_priority)
+    roll = random.random()
     
+    if roll < 0.15 and categorized[ProficiencyLevel.PROFICIENT]:
+        return random.choice(categorized[ProficiencyLevel.PROFICIENT])
+    elif roll < 0.45 and categorized[ProficiencyLevel.DECENT]:
+        return random.choice(categorized[ProficiencyLevel.DECENT])
+    
+    return min(eligible_items, key=lambda m: (
+        {'unlearned': 0, 'needs_practice': 1, 'decent': 2, 'proficient': 3}[m.category],
+        m.practice_count,
+        m.start
+    ))
+
+def create_response(item: MeasureItem) -> Response:
+    """Create JSON response for selected item"""
     return jsonify({
-        "measure": next_measure['measure'],
+        "id": item.id,  
         "stats": {
-            "category": next_measure['category'],
-            "best_rating": next_measure['best_rating'],
-            "practice_count": next_measure['practice_count'],
-            "last_practiced": next_measure['last_practiced']
+            "category": item.category,
+            "best_rating": item.best_rating,
+            "practice_count": item.practice_count,
+            "last_practiced": item.last_practiced,
+            "is_group": item.is_group
         }
     })
 

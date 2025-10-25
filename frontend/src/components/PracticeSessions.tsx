@@ -61,6 +61,7 @@ const PracticeSessions: React.FC = () => {
 
   if (loading) return <div>Loading sessions...</div>;
   if (error) return <div>Error: {error}</div>;
+  // console.log(sessions);
 
   return (
     <div className="practice-sessions">
@@ -102,7 +103,12 @@ const PracticeSessions: React.FC = () => {
               <tr key={session.id} style={{ borderTop: '1px solid #ddd' }}>
                 <td>{new Date(session.practiced_at).toLocaleString()}</td>
                 <td>{session.song_title}</td>
-                <td>M.{session.start_measure}</td>
+                <td>
+                  {session.start_measure === session.end_measure 
+                    ? `M.${session.start_measure}`
+                    : `M.${session.start_measure}-${session.end_measure}`
+                  }
+                </td>
                 <td>{session.rating}</td>
                 <td>{session.duration_seconds ? `${session.duration_seconds}s` : '-'}</td>
                 <td>{session.notes || '-'}</td>

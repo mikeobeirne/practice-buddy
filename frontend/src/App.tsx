@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react"
+import React, { Suspense, use, useMemo } from "react"
 import "./App.css"
 import MeasureViewer from "./components/MeasureViewer"
 import PracticeSessions from "./components/PracticeSessions"
@@ -12,108 +12,127 @@ interface Song {
 }
 
 interface MeasureGroup {
-  id: number
+  id: string;  
   song_id: number
   start_measure: number
   end_measure: number
 }
 
 interface MeasureRecommendation {
-  measure: number;
+  id: string;  
   stats: {
     category: 'unlearned' | 'challenging' | 'proficient';
     best_rating: number;
     practice_count: number;
     last_practiced: string | null;
     due_date: string | null;
+    is_group: boolean;
   };
 }
 
-function App() {
-  const [songs, setSongs] = useState<Song[]>([])
-  const [measureGroups, setMeasureGroups] = useState<MeasureGroup[]>([])
-  const [selectedSongId, setSelectedSongId] = useState<number | null>(null)
-  const [measureIndex, setMeasureIndex] = useState<number>(1)
-  const [recommendation, setRecommendation] = useState<MeasureRecommendation | null>(null)
-
-  // fetch songs and measure groups on mount
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        const [songsResp, groupsResp] = await Promise.all([
-          fetch("http://localhost:5000/api/songs"),
-          fetch("http://localhost:5000/api/measure-groups")
-        ])
-        const songsData = await songsResp.json()
-        const groupsData = await groupsResp.json()
-        setSongs(songsData)
-        setMeasureGroups(groupsData)
-        // Select first song by default if available
-        if (songsData.length > 0) {
-          setSelectedSongId(songsData[0].id)
-        }
-      } catch (err) {
-        console.error("Failed to fetch data:", err)
-      }
-    }
-    fetchData()
-  }, [])
-
-  // selected song details
-  const selectedSong = selectedSongId ? songs.find(s => s.id === selectedSongId) : null
-
-  // find measure group ID for current song+measure
-  const currentMeasureGroup = useMemo(() => {
-    if (!selectedSongId || !measureIndex) return null
-    return measureGroups.find(mg => 
-      mg.song_id === selectedSongId && 
-      mg.start_measure === measureIndex && 
-      mg.end_measure === measureIndex
-    ) || null
-  }, [selectedSongId, measureIndex, measureGroups])
-
-  // construct filename for current selection
-  const currentFilename = useMemo(() => {
-    if (!selectedSong) return null
-    // Get normalized folder name from source_file
-    const songFolder = selectedSong.source_file.split("/")[0]
-    // Use simplified measure filename format
-    return `${songFolder}/measure_${measureIndex}.musicxml`
-  }, [selectedSong, measureIndex])
-
-  const selectSong = (id: number | null) => {
-    setSelectedSongId(id)
-    setMeasureIndex(1)
+// Place this before dataPromise
+async function fetchRecommendation(songId: number): Promise<MeasureRecommendation | null> {
+  try {
+    const response = await fetch(`http://localhost:5000/api/songs/${songId}/next-measure`)
+    if (!response.ok) throw new Error('Failed to get next measure')
+    return await response.json()
+  } catch (err) {
+    console.error('Failed to get next measure:', err)
+    return null
   }
+}
 
-  const prev = () => {
-    if (!selectedSong) return
-    setMeasureIndex(i => {
-      const next = i - 1
-      return next < 1 ? selectedSong.total_measures : next
-    })
+// Create a promise that loads the initial data
+const dataPromise = (async () => {
+  const [songsResp, groupsResp] = await Promise.all([
+    fetch("http://localhost:5000/api/songs"),
+    fetch("http://localhost:5000/api/measure-groups")
+  ])
+  const songs = await songsResp.json()
+  const measureGroups = await groupsResp.json()
+  const initialSongId = songs[0]?.id || 0
+  
+  // Get initial recommendation if we have a song
+  const initialRecommendation = await fetchRecommendation(initialSongId);
+  console.log("initialRecommendation", initialRecommendation);
+
+  return { 
+    songs, 
+    measureGroups, 
+    initialSongId,
+    initialRecommendation 
   }
+})()
 
-  // Modify the fetchNextMeasure function to store recommendation
+// Main content component uses the 'use' hook to handle async data
+function AppContent() {
+  const { songs, measureGroups, initialSongId, initialRecommendation } = use(dataPromise)
+  
+  return (
+    <App 
+      initialSongs={songs} 
+      initialMeasureGroups={measureGroups} 
+      initialSongId={initialSongId}
+      initialRecommendation={initialRecommendation}
+    />
+  )
+}
+
+// Main App component now takes initial data as props
+function App({ 
+  initialSongs, 
+  initialSongId,
+  initialRecommendation
+}: { 
+  initialSongs: Song[]
+  initialMeasureGroups: MeasureGroup[]
+  initialSongId: number
+  initialRecommendation: MeasureRecommendation | null
+}) {
+  const [songs] = React.useState(initialSongs)
+  const [selectedSongId, setSelectedSongId] = React.useState(initialSongId)
+  const [recommendation, setRecommendation] = React.useState(initialRecommendation)
+
+
   const fetchNextMeasure = async (songId: number) => {
-    try {
-      const response = await fetch(`http://localhost:5000/api/songs/${songId}/next-measure`)
-      if (!response.ok) throw new Error('Failed to get next measure')
-      const data: MeasureRecommendation = await response.json()
-      setMeasureIndex(data.measure)
+    const data = await fetchRecommendation(songId)
+    if (data) {
       setRecommendation(data)
-    } catch (err) {
-      console.error('Failed to get next measure:', err)
     }
   }
 
-  // Remove autoAdvance state and modify the next function
-  const next = () => {
-    if (!selectedSong) return
-    setMeasureIndex(prev => 
-      prev < selectedSong.total_measures ? prev + 1 : prev
-    )
+  const selectSong = (id: number) => {  
+    setSelectedSongId(id)
+    fetchNextMeasure(id)  
   }
+
+  // Also add useEffect to fetch next measure when song is initially loaded
+  React.useEffect(() => {
+    fetchNextMeasure(selectedSongId)
+  }, [selectedSongId])
+  
+  const getMeasureInfo = (id: string) => {
+    const [folder, measurePart] = id.split('|')
+    const match = measurePart.match(/measure(\d+)(?:-(\d+))?/)
+    if (!match) return null
+    
+    const start = parseInt(match[1], 10)
+    const end = match[2] ? parseInt(match[2], 10) : start
+    return { folder, start, end }
+  }
+
+  const measureInfo = recommendation ? getMeasureInfo(recommendation.id) : null
+
+  // Add currentMeasureGroup derived from measureInfo
+  const currentMeasureGroup = useMemo(() => {
+    if (!recommendation || !measureInfo) return null;
+    return {
+      id: recommendation.id,
+      start_measure: measureInfo.start,
+      end_measure: measureInfo.end,
+      folder: measureInfo.folder
+    };
+  }, [recommendation, measureInfo]);
 
   const getRatingText = (rating: number): string => {
     switch(rating) {
@@ -125,6 +144,8 @@ function App() {
     }
   }
 
+    console.log(currentMeasureGroup);
+    console.log(currentMeasureGroup?.id);
   return (
     <div style={{ padding: 16 }}>
       <h1>Practice Buddy — Measure Viewer</h1>
@@ -132,66 +153,69 @@ function App() {
       <section style={{ marginTop: 16 }}>
         <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
           <select 
-            value={selectedSongId || ""} 
-            onChange={e => selectSong(e.target.value ? Number(e.target.value) : null)} 
+            value={selectedSongId} 
+            onChange={e => selectSong(Number(e.target.value))} 
             style={{ flex: 1 }}
           >
-            <option value="">-- choose a song --</option>
             {songs.map(s => (
               <option key={s.id} value={s.id}>{s.title}</option>
             ))}
           </select>
 
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <button onClick={prev} disabled={!selectedSong}>◀</button>
             <div style={{ minWidth: 220, textAlign: "center" }}>
-              {selectedSong ? (
-                <span>
-                  {measureIndex} / {selectedSong.total_measures} — {selectedSong.title}
-                </span>
-              ) : (
-                <span style={{ color: "#666" }}>Select a song to see measures</span>
-              )}
             </div>
-            <button onClick={next} disabled={!selectedSong}>▶</button>
           </div>
         </div>
+
+        {recommendation && measureInfo && (
+          <div style={{ 
+            marginTop: 8, 
+            padding: 12,
+            borderRadius: 4,
+            backgroundColor: recommendation.stats.category === 'unlearned' ? '#fff3e0' :
+                            recommendation.stats.category === 'challenging' ? '#e3f2fd' :
+                            '#e8f5e9',
+            fontSize: '0.9em'
+          }}>
+            <div style={{ fontWeight: 'bold', marginBottom: 4 }}>
+              {measureInfo.end > measureInfo.start ? (
+                <span>Measures {measureInfo.start}-{measureInfo.end}</span>
+              ) : (
+                <span>Measure {measureInfo.start}</span>
+              )}
+              {' '}({recommendation.stats.category})
+            </div>
+            <div>
+              Best rating: {getRatingText(recommendation.stats.best_rating)}
+              {recommendation.stats.practice_count > 0 && (
+                <>
+                  {' • '}Practiced {recommendation.stats.practice_count} times
+                  {recommendation.stats.last_practiced && (
+                    <>
+                      {' • '}Last practiced {new Date(recommendation.stats.last_practiced).toLocaleDateString()}
+                    </>
+                  )}
+                  {recommendation.stats.due_date && (
+                    <>
+                      {' • '}Due {new Date(recommendation.stats.due_date).toLocaleDateString()}
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
 
         <div style={{ border: "1px solid #ddd", padding: 8 }}>
           <MeasureViewer 
-            filename={currentFilename}
-            songId={selectedSongId}
-            measureGroupId={currentMeasureGroup?.id}
-            onMeasureChange={setMeasureIndex}
+            measureGroupId={currentMeasureGroup?.id ?? null}
+            onPracticeLogged={() => {
+              fetchNextMeasure(selectedSongId)
+            }}
           />
         </div>
       </section>
-
-      {recommendation && recommendation.measure === measureIndex && (
-        <div style={{ 
-          marginTop: 8, 
-          padding: 12,
-          borderRadius: 4,
-          backgroundColor: recommendation.stats.category === 'unlearned' ? '#fff3e0' :
-                          recommendation.stats.category === 'challenging' ? '#e3f2fd' :
-                          '#e8f5e9',
-          fontSize: '0.9em'
-        }}>
-          <div style={{ fontWeight: 'bold', marginBottom: 4 }}>
-            Measure {recommendation.measure} ({recommendation.stats.category})
-          </div>
-          <div>
-            Best rating: {getRatingText(recommendation.stats.best_rating)}
-            {recommendation.stats.practice_count > 0 && (
-              <>
-                {' • '}Practiced {recommendation.stats.practice_count} times
-                {' • '}Last practiced {new Date(recommendation.stats.last_practiced!).toLocaleDateString()}
-                {' • '}Due {new Date(recommendation.stats.due_date!).toLocaleDateString()}
-              </>
-            )}
-          </div>
-        </div>
-      )}
 
       <section style={{ marginTop: 32 }}>
         <PracticeSessions />
@@ -200,4 +224,11 @@ function App() {
   )
 }
 
-export default App
+// Wrap the async component in Suspense
+export default function AppWrapper() {
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      <AppContent />
+    </Suspense>
+  )
+}
